@@ -1,0 +1,172 @@
+#BERTを用いたテキスト分類の演習
+#この演習ではGPUを用いるので，メニューの「ランタイム」から「ランタイムのタイプを変更」を選んで，GPUを選択しておきましょう.
+
+
+
+#学習データと評価データをダウンロードします．
+import gdown
+gdown.download('https://drive.google.com/uc?id=176UsOCCYN55EbcDOtJwGH2ChFQW_Tmh4','train.txt', quiet=False)
+gdown.download('https://drive.google.com/uc?id=1_zB9uSqG6kEMtnc99rGOfObbs7LdAHf5','test.txt', quiet=False)
+
+
+
+!shuf filmreview.txt -o shuffled.txt
+
+
+
+!head shuffled.txt
+
+
+
+!head filmtest.txt
+
+
+
+#学習に必要なライブラリをインストールします．
+!pip install transformers fugashi ipadic pytorch-lightning unidic-lite
+
+
+
+#学習データを読み込みます．
+import torch
+from torch.utils.data import DataLoader
+from transformers import BertJapaneseTokenizer, BertForSequenceClassification
+
+# 日本語の事前学習モデル
+# MODEL_NAME = 'cl-tohoku/bert-base-japanese-whole-word-masking'
+MODEL_NAME = 'cl-tohoku/bert-base-japanese-v3'
+
+# 学習データの読み込み
+train_lines = [x.rstrip().split('\t')[1] for x in open("shuffled.txt").readlines()]
+train_labels = [int(x.split('\t')[0]) for x in open("shuffled.txt").readlines()]
+
+# テストデータの読み込み
+test_lines = [x.rstrip().split('\t')[1] for x in open("filmtest.txt").readlines()]
+test_labels = [int(x.split('\t')[0]) for x in open("filmtest.txt").readlines()]
+
+# 単語分割モデルの読み込み
+tokenizer = BertJapaneseTokenizer.from_pretrained(MODEL_NAME)
+
+def create_dataset_for_loader(lines, labels):
+  dataset_for_loader = []
+  for i in range(len(lines)):
+    encoding = tokenizer(lines[i],max_length=128,padding='max_length',truncation=True)
+    encoding['labels'] = labels[i]
+    encoding = { k: torch.tensor(v) for k, v in encoding.items() }
+    dataset_for_loader.append(encoding)
+  return dataset_for_loader
+
+dataset_for_loader_train = create_dataset_for_loader(train_lines, train_labels)
+dataset_for_loader_test = create_dataset_for_loader(test_lines, test_labels)
+
+dataset_train = dataset_for_loader_train[10:] # 学習データ
+dataset_val = dataset_for_loader_train[:10] # 検証データ
+dataset_test = dataset_for_loader_test # 評価データ
+
+dataloader_train = DataLoader(
+    dataset_train, batch_size=16, shuffle=True
+)
+dataloader_val = DataLoader(dataset_val, batch_size=16)
+dataloader_test = DataLoader(dataset_test, batch_size=1)
+
+
+
+#以下のコードにより，モデルの定義をします．
+from tqdm import tqdm
+import torch
+from torch.utils.data import DataLoader
+
+from transformers import BertJapaneseTokenizer, BertForSequenceClassification
+import pytorch_lightning as pl
+
+class BertForSequenceClassification_pl(pl.LightningModule):
+    def __init__(self, model_name, num_labels, lr):
+        super().__init__()
+        self.save_hyperparameters()
+        self.bert_sc = BertForSequenceClassification.from_pretrained(
+            model_name, num_labels=num_labels)
+        self.test_results = []
+
+    def training_step(self, batch, batch_idx):
+        output = self.bert_sc(**batch)
+        loss = output.loss
+        self.log('train_loss', loss)
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        output = self.bert_sc(**batch)
+        val_loss = output.loss
+        self.log('val_loss', val_loss)
+
+    def reset_test_results(self):
+        self.test_results = []
+
+    def test_step(self, batch, batch_idx):
+        labels = batch.pop('labels')
+        output = self.bert_sc(**batch)
+        probs = torch.nn.functional.softmax(output.logits,dim=-1)
+        labels_predicted = output.logits.argmax(-1)
+        num_correct = ( labels_predicted == labels ).sum().item()
+        accuracy = num_correct/labels.size(0)
+        hyp = labels_predicted.cpu().numpy()[0]
+        ref = labels.cpu().numpy()[0]
+        prob = probs.cpu().numpy()[0][hyp]
+        self.test_results.append({"hyp":hyp, "ref": ref, "prob":prob})
+        self.log('accuracy', accuracy)
+
+    def configure_optimizers(self):
+        return torch.optim.Adam(self.parameters(), lr=self.hparams.lr)
+
+# 学習時にモデルの重みを保存する条件を指定
+checkpoint = pl.callbacks.ModelCheckpoint(
+    monitor='val_loss',
+    mode='min',
+    save_top_k=1,
+    save_weights_only=True,
+    dirpath='model/',
+)
+
+# 学習が進まなくなったら終了する条件を指定
+early_stopping = pl.callbacks.EarlyStopping(
+    min_delta=0.00,
+    patience=1,
+    verbose=True,
+    monitor='val_loss',
+    mode='min',
+)
+
+# 学習の方法を指定
+trainer = pl.Trainer(max_epochs=10,
+                    accelerator="auto",
+                    callbacks = [checkpoint,early_stopping])
+
+# 学習に利用するモデルの作成
+model = BertForSequenceClassification_pl(MODEL_NAME, num_labels=2, lr=1e-5)
+
+
+
+#学習の実行（3分程度時間がかかります）
+trainer.fit(model, dataloader_train, dataloader_val)
+best_model_path = checkpoint.best_model_path # ベストモデルのファイル
+print('ベストモデルのファイル: ', checkpoint.best_model_path)
+print('ベストモデルの検証データに対する損失: ', checkpoint.best_model_score)
+
+
+
+#分類の実行と結果の表示．連番，正解ラベル，予測ラベル，確率，本文の順番で結果が出ます．
+model.reset_test_results()
+test = trainer.test(dataloaders=dataloader_test)
+
+for i in range(len(test_lines)):
+  line = test_lines[i]
+  label = test_labels[i]
+  d = model.test_results[i]
+  hyp = d['hyp'].item()
+  prob = d['prob'].item()
+  print(f"{i+1}\t{label}\t{hyp}\t{prob}\t{line}")
+
+print(f'Accuracy: {test[0]["accuracy"]:.3f}')
+
+
+
+#精度は何パーセントになりましたか？
